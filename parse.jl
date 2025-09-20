@@ -4,6 +4,14 @@
 # To update code, comment out the baremodule ParseNumberErrors, and the import
 # below it, then re-include.
 
+import Base.Checked: add_with_overflow, mul_with_overflow
+
+@inline function _unsafe_new_substring(s::AbstractString)
+    return @inbounds @inline SubString{typeof(s)}(s, 0, ncodeunits(s), Val{:noshift}())
+end
+
+_unsafe_new_substring(s::SubString) = s
+
 @inline function _unsafe_new_substring(s::AbstractString, offset::Int, ncodeunits::Int)
     return @inbounds @inline SubString{typeof(s)}(s, offset, ncodeunits, Val{:noshift}())
 end
@@ -80,6 +88,7 @@ struct MisMatchingBase
     given::UInt8
 end
 
+#=
 baremodule ParseNumberErrors
     import ..@enum
     @enum ParseNumberError::UInt8 begin
@@ -94,6 +103,7 @@ baremodule ParseNumberErrors
 end
 
 using .ParseNumberErrors: ParseNumberError
+=#
 
 struct ParseIntError
     pos::Int
@@ -155,9 +165,9 @@ function check_valid_base(base::Integer)::Union{UInt8, ParseIntError}
     return base % UInt8
 end
 
-# We use this function to avoid calling lstrip unless necessary, to increase
-# the likelihood that this inlines
-@inline function unlikely_lstrip(s::SubString)
+# We use this function to avoid calling lstrip unless necessary, to make the
+# code it generates small and likely to inline
+function unlikely_lstrip(s::SubString)
     isempty(s) && return s
     cu = @inbounds codeunit(s, 1)
     return if (cu in UInt8('\t'):UInt8(' ')) | (cu > 0x7f)
@@ -221,28 +231,45 @@ function tryparse(::Type{Float16}, s::AbstractString)
     return convert(Union{Float16, Nothing}, tryparse(Float32, s))
 end
 
-# TODO: Insert a check for UInt8 codeunit type, this code is only valid for that.
-function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) where {T <: Signed}
+# TODO: Named parse2 for now, rename to parse
+function parse2(::Type{T}, s::AbstractString; base::Union{Nothing, Integer} = nothing) where {T <: Integer}
+    result = @inline parse_internal(T, _unsafe_new_substring(s), base)
+    return result isa Integer ? result : throw_parse_int_error(result)
+end
+
+function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) where {T <: Integer}
+    # A base of `nothing` means to determine it from the integer prefix, e.g.
+    # 0x -> 16, 0o -> 8.
     if base !== nothing
         base = check_valid_base(base)
         base isa ParseIntError && return base
     end
     ncu = ncodeunits(s)
+    # Remove leading whitespace
     s = unlikely_lstrip(s)
     isempty(s) && return ParseIntError(ncu, ParseNumberErrors.whitespace_string)
+    # Remove a leading + or - with following optional whitespace, and get the sign
     (is_positive, s) = parseint_sign(s)
+    # If starts with 0b, base is 2, 0x -> 16, 0o -> 8, else 10
     (observed_base, s) = parseint_base(s)
     if isnothing(base)
         base = observed_base
     elseif (observed_base != 0x0a) & (base != observed_base)
-        error()
+        # If obsereved base is 10, we did not observe a prefix, so don't throw
+        consumed_cu = ncu - ncodeunits(s)
+        return ParseIntError(consumed_cu + 2, MisMatchingBase(observed_base, base))
     end
+    # A string like "-" or "- 0x" ends prematurely
     isempty(s) && return ParseIntError(ncu, ParseNumberErrors.premature_end)
     # Base 10 is going to be, by far, the most normal case, so optimise for that.
-    consumed_bytes = ncu - ncodeunits(s)
+    consumed_cu = ncu - ncodeunits(s)
     return if base == 0x0a
+        # Base 10 is by far the most common base, so we inline the happy path of base 10
+        # parsing here.
         n = zero(T)
         base = T(10)
+        # Most integers are far below typemax/typemin, so as long as we're below max_no_overflow,
+        # the next digit can't cause overflow
         max_no_overflow = div(typemax(T) - T(9), base)
         index = 1
         while index ≤ ncodeunits(s)
@@ -256,13 +283,16 @@ function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) 
         if index > ncodeunits(s)
             return is_positive ? n : -n
         else
-            return parseint_unhappy(n, 0x0a, _unsafe_skip_codeunits(s, index - 1), consumed_bytes + index - 1, is_positive)
+            # All the slow conditions (overflow, strange base, spaces in the string etc. go here)
+            return parseint_unhappy(n, 0x0a, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive)
         end
     elseif base == 0x10
-        error()
-        # return fastpath_base_16()
+        # Base 16 is the second most popular base. It gets a fast path too, though not inlined into
+        # this function.
+        parseint_base16(T, s, consumed_cu, is_positive)
     else
-        parseint_unhappy(T(0), base, s, consumed_bytes, is_positive)
+        # All other bases go to the slow fallback function.
+        parseint_unhappy(T(0), base, s, consumed_cu, is_positive)
     end
 end
 
@@ -279,7 +309,7 @@ end
     end
     s = if has_sign
         # Safety: This function is only called after an `isempty` check,
-        # so we know there is at least 1 codeunit.
+        # so we know there is at least 1 codeunit.parseint_sig
         s = unlikely_lstrip(_unsafe_skip_codeunits(s, 1))
     else
         s
@@ -305,7 +335,28 @@ end
     end
 end
 
-@noinline function parseint_unhappy(n::Integer, base::UInt8, s::SubString, consumed_bytes::Int, is_positive::Bool)
+# A base-16 version of the base 10 version inlines in parse_internal
+@noinline function parseint_base16(::Type{T}, s::SubString, consumed_cu::Int, is_positive::Bool) where {T <: Integer}
+    n = zero(T)
+    base = T(16)
+    max_no_overflow = div(typemax(T) - T(15), base)
+    index = 1
+    while index ≤ ncodeunits(s)
+        n > max_no_overflow && break
+        cu = @inbounds codeunit(s, index)
+        digit = cu - UInt8('0')
+        digit > 0x0f && break
+        n = base * n + T(digit)
+        index += 1
+    end
+    if index > ncodeunits(s)
+        return is_positive ? n : -n
+    else
+        return parseint_unhappy(n, 0x10, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive)
+    end
+end
+
+@noinline function parseint_unhappy(n::Integer, base::UInt8, s::SubString, consumed_cu::Int, is_positive::Bool)
     T = typeof(n)
     index = 1
     ncu = ncodeunits(s)
@@ -330,9 +381,9 @@ end
                 char = @inbounds s[index]
             end
             if seen_space
-                return ParseIntError(index + consumed_bytes, ParseNumberErrors.extra_after_whitespace)
+                return ParseIntError(index + consumed_cu, ParseNumberErrors.extra_after_whitespace)
             else
-                return ParseIntError(index + consumed_bytes, BadDigit(base, first_utf8_byte(char)))
+                return ParseIntError(index + consumed_cu, BadDigit(base, first_utf8_byte(char)))
             end
         end
         (new_n, mul_overflowed) = mul_with_overflow(n, T(base))
@@ -340,7 +391,7 @@ end
         if (mul_overflowed | add_overflowed)
             # If we're parsing typemin(T), we hit overflow here, but it's not an error.
             # new_n == typemin(T), and then at the end we do -n at the end, which does nothing.
-            is_positive | (new_n != typemin(T)) && return ParseIntError(index + consumed_bytes, ParseNumberErrors.overflow)
+            is_positive | (new_n != typemin(T)) && return ParseIntError(index + consumed_cu, ParseNumberErrors.overflow)
         end
         index += 1
         n = new_n
@@ -366,3 +417,6 @@ end
         base
     end
 end
+
+# TODO: Parse bool
+# Parse Complex
