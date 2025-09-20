@@ -6,6 +6,7 @@
 
 import Base.Checked: add_with_overflow, mul_with_overflow
 
+# https://github.com/JuliaLang/julia/pull/59606
 @inline function _unsafe_new_substring(s::AbstractString)
     return @inbounds @inline SubString{typeof(s)}(s, 0, ncodeunits(s), Val{:noshift}())
 end
@@ -29,6 +30,10 @@ end
 @noinline function slow_isspace(c::AbstractChar)
     return '\ua0' <= c && Base.Unicode.category_code(c) == Base.Unicode.UTF8PROC_CATEGORY_ZS
 end
+
+# https://github.com/JuliaLang/julia/pull/59615
+@propagate_inbounds thisind(s::SubString{String}, i::Int) = _thisind_str(s, i)
+@propagate_inbounds nextind(s::SubString{String}, i::Int) = _nextind_str(s, i)
 
 """
     parse(type, str; base)
@@ -88,7 +93,6 @@ struct MisMatchingBase
     given::UInt8
 end
 
-#=
 baremodule ParseNumberErrors
     import ..@enum
     @enum ParseNumberError::UInt8 begin
@@ -103,7 +107,6 @@ baremodule ParseNumberErrors
 end
 
 using .ParseNumberErrors: ParseNumberError
-=#
 
 struct ParseIntError
     pos::Int
@@ -169,6 +172,7 @@ end
 # code it generates small and likely to inline
 function unlikely_lstrip(s::SubString)
     isempty(s) && return s
+    # Safety: We just checked s is not empty, so index 1 is always valid
     cu = @inbounds codeunit(s, 1)
     return if (cu in UInt8('\t'):UInt8(' ')) | (cu > 0x7f)
         lstrip(isspace, s)
@@ -177,7 +181,7 @@ function unlikely_lstrip(s::SubString)
     end
 end
 
-function parse_internal(::Type{T}, c::AbstractChar, base::Integer = 10) where {T <: Integer}
+function parse_internal(::Type{T}, c::AbstractChar, base::Integer) where {T <: Integer}
     a::UInt8 = (base <= 36 ? 10 : 36)
     base = check_valid_base(base)
     base isa ParseIntError && return base
@@ -274,6 +278,7 @@ function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) 
         index = 1
         while index ≤ ncodeunits(s)
             n > max_no_overflow && break
+            # Safety:
             cu = @inbounds codeunit(s, index)
             digit = cu - UInt8('0')
             digit > 0x09 && break
@@ -321,6 +326,7 @@ end
 @inline function parseint_base(s::SubString)::Tuple{UInt8, SubString{String}}
     # Note: Space must have been stripped off before
     ncodeunits(s) < 2 && return (0x0a, s)
+    # Safety: We just checked there are 2 codeunits or more
     (c1, c2) = (@inbounds(codeunit(s, 1)), @inbounds(codeunit(s, 2)))
     # Safety: We checked at least two codeunits just above
     rest = _unsafe_skip_codeunits(s, 2)
@@ -376,8 +382,11 @@ end
             seen_space = false
             while fast_isspace(char)
                 seen_space = true
+                # Safety: We obtained index from a nextind call (or, the first time,
+                # see the above comment on safety, and exit on OOB, so this is inbounds)
                 index = @inbounds nextind(s, index)
                 index > ncu && @goto return_n
+                # Safety: We just checked this in inbounds and obtained the index from a nextind call
                 char = @inbounds s[index]
             end
             if seen_space
@@ -418,5 +427,59 @@ end
     end
 end
 
-# TODO: Parse bool
+# Again, this compiles to very little code, so we inline it.
+function try_literal(s::Union{String, SubString{String}})
+    ncu = ncodeunits(s)
+    ncu < 4 && return nothing
+    n = (@inbounds(codeunit(s, 1)) % UInt32) |
+        ((@inbounds(codeunit(s, 2)) % UInt32) << 8) |
+        ((@inbounds(codeunit(s, 3)) % UInt32) << 16) |
+        ((@inbounds(codeunit(s, 4)) % UInt32) << 24)
+    (ncu == 4) & (n == 0x0000065_75_72_74) && return true
+    if ncu == 5
+        five = @inbounds codeunit(s, 5)
+        (ncu == 4) & (n == 0x0000073_6c_61_66) & (five == 0x65) && return false
+    end
+    return nothing
+end
+
+function parse_internal(::Type{Bool}, s::SubString, base::Union{Integer, Nothing})
+    # This is identical to the general case, except for two reasons:
+    # We do not accept a leading + or -
+    # We also accept "true" and "false"
+    if base !== nothing
+        base = check_valid_base(base)
+        base isa ParseIntError && return base
+    end
+    ncu = ncodeunits(s)
+    s = unlikely_lstrip(s)
+    isempty(s) && return ParseIntError(ncu, ParseNumberErrors.whitespace_string)
+
+    # As a special case, we accept literal "true" and "false"
+    if s isa Union{String, SubString{String}}
+        literal = @inline try_literal(s)
+        literal isa Bool && return literal
+    else
+        s == "true" && return true
+        s == "false" && return false
+    end
+
+    (observed_base, s) = parseint_base(s)
+    if isnothing(base)
+        base = observed_base
+    elseif (observed_base != 0x0a) & (base != observed_base)
+        consumed_cu = ncu - ncodeunits(s)
+        return ParseIntError(consumed_cu + 2, MisMatchingBase(observed_base, base))
+    end
+    return isempty(s) && return ParseIntError(ncu, ParseNumberErrors.premature_end)
+
+    # We don't care about base when parsing bool, because no matter the base,
+    # we only accept 0 or 1
+
+    # TODO: Skip any number of zeros, and then one 1.
+
+
+end
+
+# TODO
 # Parse Complex
