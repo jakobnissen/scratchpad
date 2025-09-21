@@ -23,11 +23,12 @@ end
 end
 
 function fast_isspace(c::AbstractChar)
-    (c == ' ' || '\t' <= c <= '\r' || c == '\u85') && return true
+    (c == ' ' || '\t' <= c <= '\r') && return true
     return slow_isspace(c)
 end
 
 @noinline function slow_isspace(c::AbstractChar)
+    c == '\u85' && return true
     return '\ua0' <= c && Base.Unicode.category_code(c) == Base.Unicode.UTF8PROC_CATEGORY_ZS
 end
 
@@ -276,12 +277,13 @@ function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) 
         # the next digit can't cause overflow
         max_no_overflow = div(typemax(T) - T(9), base)
         index = 1
+        seen_any = false
         while index ≤ ncodeunits(s)
             n > max_no_overflow && break
-            # Safety:
             cu = @inbounds codeunit(s, index)
             digit = cu - UInt8('0')
             digit > 0x09 && break
+            seen_any = true
             n = base * n + T(digit)
             index += 1
         end
@@ -289,7 +291,7 @@ function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) 
             return is_positive ? n : -n
         else
             # All the slow conditions (overflow, strange base, spaces in the string etc. go here)
-            return parseint_unhappy(n, 0x0a, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive)
+            return parseint_unhappy(n, 0x0a, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive, seen_any)
         end
     elseif base == 0x10
         # Base 16 is the second most popular base. It gets a fast path too, though not inlined into
@@ -297,12 +299,12 @@ function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) 
         parseint_base16(T, s, consumed_cu, is_positive)
     else
         # All other bases go to the slow fallback function.
-        parseint_unhappy(T(0), base, s, consumed_cu, is_positive)
+        parseint_unhappy(T(0), base, s, consumed_cu, is_positive, false)
     end
 end
 
 # Note: This function is efficient (generated little code), but does not inline by itself
-@inline function parseint_sign(s::SubString)::Tuple{Bool, SubString{String}}
+@inline function parseint_sign(s::SubString)::Tuple{Bool, SubString}
     # Note: Space must have been stripped off left before, and must not be empty
     cu = @inbounds codeunit(s, 1)
     (sign, has_sign) = if cu == UInt8('+')
@@ -323,7 +325,7 @@ end
 end
 
 # Note: This function is efficient (generated little code), but does not inline by itself
-@inline function parseint_base(s::SubString)::Tuple{UInt8, SubString{String}}
+@inline function parseint_base(s::SubString)::Tuple{UInt8, SubString}
     # Note: Space must have been stripped off before
     ncodeunits(s) < 2 && return (0x0a, s)
     # Safety: We just checked there are 2 codeunits or more
@@ -347,22 +349,31 @@ end
     base = T(16)
     max_no_overflow = div(typemax(T) - T(15), base)
     index = 1
+    seen_any = false
     while index ≤ ncodeunits(s)
         n > max_no_overflow && break
         cu = @inbounds codeunit(s, index)
         digit = cu - UInt8('0')
         digit > 0x0f && break
         n = base * n + T(digit)
+        seen_any = true
         index += 1
     end
     if index > ncodeunits(s)
         return is_positive ? n : -n
     else
-        return parseint_unhappy(n, 0x10, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive)
+        return parseint_unhappy(n, 0x10, _unsafe_skip_codeunits(s, index - 1), consumed_cu + index - 1, is_positive, seen_any)
     end
 end
 
-@noinline function parseint_unhappy(n::Integer, base::UInt8, s::SubString, consumed_cu::Int, is_positive::Bool)
+@noinline function parseint_unhappy(
+        n::Integer,
+        base::UInt8,
+        s::SubString,
+        consumed_cu::Int,
+        is_positive::Bool,
+        seen_any::Bool
+    )
     T = typeof(n)
     index = 1
     ncu = ncodeunits(s)
@@ -385,7 +396,10 @@ end
                 # Safety: We obtained index from a nextind call (or, the first time,
                 # see the above comment on safety, and exit on OOB, so this is inbounds)
                 index = @inbounds nextind(s, index)
-                index > ncu && @goto return_n
+                if index > ncu
+                    seen_any || return ParseIntError(index + consumed_cu, ParseNumberErrors.premature_end)
+                    @goto return_n
+                end
                 # Safety: We just checked this in inbounds and obtained the index from a nextind call
                 char = @inbounds s[index]
             end
@@ -427,22 +441,27 @@ end
     end
 end
 
+# TODO: Mention in PR that this fixes an unsafe pointer use case when parsing Bool
 # Again, this compiles to very little code, so we inline it.
-function try_literal(s::Union{String, SubString{String}})
+@inline function try_literal(s::Union{String, SubString{String}})
     ncu = ncodeunits(s)
     ncu < 4 && return nothing
     n = (@inbounds(codeunit(s, 1)) % UInt32) |
         ((@inbounds(codeunit(s, 2)) % UInt32) << 8) |
         ((@inbounds(codeunit(s, 3)) % UInt32) << 16) |
         ((@inbounds(codeunit(s, 4)) % UInt32) << 24)
-    (ncu == 4) & (n == 0x0000065_75_72_74) && return true
+    # NB: At the time of writing, Runic is broken for hex literals
+    # runic: off
+    (ncu == 4) & (n == 0x65_75_72_74) && return true
     if ncu == 5
         five = @inbounds codeunit(s, 5)
-        (ncu == 4) & (n == 0x0000073_6c_61_66) & (five == 0x65) && return false
+        (n == 0x73_6c_61_66) & (five == 0x65) && return false
     end
+    # runic: on
     return nothing
 end
 
+# TODO: Mention that this PR fixes leading zeros for bool
 function parse_internal(::Type{Bool}, s::SubString, base::Union{Integer, Nothing})
     # This is identical to the general case, except for two reasons:
     # We do not accept a leading + or -
@@ -471,14 +490,55 @@ function parse_internal(::Type{Bool}, s::SubString, base::Union{Integer, Nothing
         consumed_cu = ncu - ncodeunits(s)
         return ParseIntError(consumed_cu + 2, MisMatchingBase(observed_base, base))
     end
-    return isempty(s) && return ParseIntError(ncu, ParseNumberErrors.premature_end)
-
+    isempty(s) && return ParseIntError(ncu, ParseNumberErrors.premature_end)
     # We don't care about base when parsing bool, because no matter the base,
     # we only accept 0 or 1
+    i = 1
+    n = false
+    seen_zero = false
+    while i ≤ ncodeunits(s)
+        cu = @inbounds codeunit(s, i)
+        if cu == 0x30
+            seen_zero = true
+        elseif cu == 0x31
+            n && return ParseIntError(ncu - ncodeunits(s) + i, ParseNumberErrors.overflow)
+            n = true
+        else
+            # s cannot be empty because i is inbounds, so skipping i-1 codeunits
+            # cannot create an empty string.
+            s = _unsafe_skip_codeunits(s, i - 1)
+            consumed_cu = ncu - ncodeunits(s)
+            return bool_unhappy(n, seen_zero, consumed_cu, s)
+        end
+        i += 1
+    end
+    return if n
+        true
+    else
+        seen_zero ? false : ParseIntError(ncu, ParseNumberErrors.premature_end)
+    end
+end
 
-    # TODO: Skip any number of zeros, and then one 1.
-
-
+@noinline function bool_unhappy(n::Bool, seen_zero::Bool, consumed_cu::Int, s::SubString)
+    # NB: s cannot be empty
+    i = 1
+    char = @inbounds s[i]
+    seen_whitespace = false
+    while fast_isspace(char)
+        seen_whitespace = true
+        i = @inbounds nextind(s, i)
+        if i > ncodeunits(s)
+            n && return true
+            seen_zero && return false
+            return ParseIntError(ncodeunits(s) + consumed_cu, ParseNumberErrors.premature_end)
+        end
+        char = @inbounds s[i]
+    end
+    return if seen_whitespace
+        ParseIntError(consumed_cu + i, ParseNumberErrors.extra_after_whitespace)
+    else
+        ParseIntError(consumed_cu + i, BadDigit(0x02, @inbounds(codeunit(s, i))))
+    end
 end
 
 # TODO
