@@ -242,19 +242,51 @@ function parse2(::Type{T}, s::AbstractString; base::Union{Nothing, Integer} = no
     return result isa Integer ? result : throw_parse_int_error(result)
 end
 
-function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) where {T <: Integer}
-    # A base of `nothing` means to determine it from the integer prefix, e.g.
-    # 0x -> 16, 0o -> 8.
+@inline function parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) where {T <: Integer}
     if base !== nothing
         base = check_valid_base(base)
         base isa ParseIntError && return base
+        base != 10 && return generic_parse_internal(T, s, base)
     end
+    cus = codeunits(s)
+    isempty(cus) && return ParseIntError(0, ParseNumberErrors.whitespace_string)
+    (positive, cus) = (T <: Signed) ? get_sign(s) : (true, cus)
+    length(cus) < max_digits(T) || generic_parse_internal(T, s, base)
+    n = zero(T)
+    for cu in cus
+        # TODO: We could use a different slow path here if more than 1 codeunit
+        # has been consumed. In that case, we know it begins with - or [0-9].
+        # Also, here we know it can't overflow.
+        in(cu, 0x30:0x39) || return generic_parse_internal(T, s, base)
+        n = T(10) * n + T(cu - 0x30)
+    end
+    return positive ? n : -n
+end
+
+# Maximum number of digits in a number.
+function max_digits(::Type{T}) where {T <: BitInteger}
+    return trunc(Int, log10(typemax(T)) + 1)
+end
+max_digits(::Type{T}) where T <: Integer = 0
+
+@inline function get_sign(s::SubString)
+    nonempty_codeunits = codeunits(s)
+    if (@inbounds nonempty_codeunits[1]) == UInt8('-')'
+        s = _unsafe_skip_codeunits(s, 1)
+        (false, codeunits(s))
+    else
+        (true, nonempty_codeunits)
+    end
+end
+
+function generic_parse_internal(::Type{T}, s::SubString, base::Union{Nothing, Integer}) where {T <: Integer}
     ncu = ncodeunits(s)
     # Remove leading whitespace
     s = unlikely_lstrip(s)
     isempty(s) && return ParseIntError(ncu, ParseNumberErrors.whitespace_string)
     # Remove a leading + or - with following optional whitespace, and get the sign
     (is_positive, s) = parseint_sign(s)
+    ((T <: Unsigned) & !is_positive) && return ParseIntError(ncu - ncodeunits(s) + 1, ParseNumberErrors.overflow)
     # If starts with 0b, base is 2, 0x -> 16, 0o -> 8, else 10
     (observed_base, s) = parseint_base(s)
     if isnothing(base)
@@ -543,3 +575,86 @@ end
 
 # TODO
 # Parse Complex
+
+#=
+# Load the first 8 bytes from `ptr`, subtract 0x30, and convert to UInt32.
+# Only load where the corresponding bit of the mask is one.
+# The least significant bit corresponds to the first byte pointed to.
+Base.@assume_effects :total @inline function load_masked(ptr::Ptr{UInt8}, mask::UInt8)
+    code = """
+    %mask = bitcast i8 %1 to <8 x i1>
+    %loaded = call <8 x i8> @llvm.masked.load.v8i8.p0(
+                    ptr %0,
+                    i32 1,
+                    <8 x i1> %mask,
+                    <8 x i8> <i8 48, i8 48, i8 48, i8 48,
+                                   i8 48, i8 48, i8 48, i8 48>)
+    %negd = sub <8 x i8> %loaded, <i8 48, i8 48, i8 48, i8 48,
+                                   i8 48, i8 48, i8 48, i8 48>
+    ret <8 x i8> %negd
+    """
+    x = Core.Intrinsics.llvmcall(
+        code,
+        NTuple{8, VecElement{UInt8}},
+        Tuple{Ptr{UInt8}, UInt8},
+        ptr, mask
+    )
+    return x
+end
+
+# NB: For some reason, a Julia implementation of this does not produce good code,
+# as it insists on doing the mul in two separate 128-bit registers
+@inline Base.@assume_effects :total function widen_mul(v::NTuple{8, VecElement{UInt8}})
+    code = """
+    %wide = zext <8 x i8> %0 to <8 x i32>
+    %muld = mul <8 x i32> %wide, <i32 10000000, i32 1000000, i32 100000, i32 10000,
+                                  i32     1000, i32     100, i32     10, i32     1>
+    ret <8 x i32> %muld
+    """
+    return Core.Intrinsics.llvmcall(code, NTuple{8, VecElement{UInt32}}, Tuple{NTuple{8, VecElement{UInt8}}}, v)
+end
+
+# Given 8 bytes, check all are in 0-9, or return nothing if not.
+# Sum in base 10, e.g. if it was two bytes then (0x04, 0x05) -> 45.
+@inline Base.@assume_effects :total function sum_base_10(x::NTuple{8, VecElement{UInt8}})
+    an = reduce(reinterpret(NTuple{8, UInt8}, x); init = false) do a, i
+        a | (i > 0x09)
+    end
+    an && return nothing
+    x = reinterpret(NTuple{8, UInt32}, widen_mul(x))
+    return reduce(x) do acc, i
+        acc + i
+    end
+end
+
+function quickparse_base10(::Type{T}, s::SubString{String}) where {T <: Integer}
+    n = T(0)
+    ncu = ncodeunits(s)
+    # We load 8 bytes at a time, so first, we load the lower 8 digits,
+    # and multiply by 1. Then we load the next 8 and multiply by 10^8 etc.
+    factor = T(1)
+    mult = typemax(T) > 100_000_000 ? T(100_000_000) : T(0)
+    # For the last load, we might not have a whole 8-byte chunk. So, we mask
+    # out the first rem(ncu, 8) bytes, to load not them at all
+    # (note: this is not undefined behaviour, since we never load the bytes)
+    maskshift = (UInt(8) - (ncu % UInt)) % UInt(8)
+    mask = 0xff << (maskshift & 7)
+    GC.@preserve s begin
+        # Load from end of string to beginning.
+        start_ptr = pointer(s)
+        ptr = start_ptr + ncu - 8
+        while ncu > 0
+            # If we're out of bounds, apply mask. Else, load all bytes.
+            local_mask = ptr < start_ptr ? mask : 0xff
+            vectup = load_masked(ptr, local_mask)
+            chunk_sum = sum_base_10(vectup)
+            chunk_sum === nothing && return nothing
+            n += (chunk_sum % T) * factor
+            ptr -= 8
+            ncu -= 8
+            factor *= mult
+        end
+    end
+    return n
+end
+=#
